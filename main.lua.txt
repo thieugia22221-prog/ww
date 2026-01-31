@@ -1,0 +1,1884 @@
+repeat task.wait() until game:IsLoaded()
+
+task.spawn(function()
+    ----------------------------------------------------------------
+    -- SERVICES
+    ----------------------------------------------------------------
+    local Players = game:GetService("Players")
+    local TweenService = game:GetService("TweenService")
+    local HttpService = game:GetService("HttpService")
+    local UserInputService = game:GetService("UserInputService")
+    local TeleportService = game:GetService("TeleportService")
+
+    local player = Players.LocalPlayer
+    local playerGui = player:WaitForChild("PlayerGui")
+
+    ----------------------------------------------------------------
+    -- ✅ API CONFIG
+    ----------------------------------------------------------------
+    local API_BASE = ''https://join-server.pages.dev''
+    local PLACE_ID = 109983668079237
+
+    local POLL_INTERVAL = 0.05
+    local MAX_ROWS = 15
+    local RETRY_SECONDS = 2
+    local EXTRA_SCRIPT_RAW = ""
+
+    ----------------------------------------------------------------
+    -- FILE SAVE (Blacklist persist)
+    ----------------------------------------------------------------
+    local SAVE_FILE = "tanphu_blacklist_v1.json"
+
+    local function canFileIO()
+        return (type(readfile) == "function" and type(writefile) == "function")
+    end
+
+    local function safeReadFile(path)
+        if not canFileIO() then return nil end
+        local ok, res = pcall(function() return readfile(path) end)
+        if ok then return res end
+        return nil
+    end
+
+    local function safeWriteFile(path, data)
+        if not canFileIO() then return false end
+        local ok = pcall(function() writefile(path, data) end)
+        return ok
+    end
+
+    local function loadSavedBlacklist()
+        local raw = safeReadFile(SAVE_FILE)
+        if not raw or raw == "" then return { selected = {} } end
+        local ok, data = pcall(function() return HttpService:JSONDecode(raw) end)
+        if ok and type(data) == "table" then
+            data.selected = data.selected or {}
+            return data
+        end
+        return { selected = {} }
+    end
+
+    local function saveBlacklistSelected(selectedMap)
+        local payload = { selected = selectedMap or {} }
+        safeWriteFile(SAVE_FILE, HttpService:JSONEncode(payload))
+    end
+
+    ----------------------------------------------------------------
+    -- HTTP IMPL
+    ----------------------------------------------------------------
+    local http_impl
+    if typeof(syn) == "table" and typeof(syn.request) == "function" then
+        http_impl = syn.request
+    elseif typeof(http_request) == "function" then
+        http_impl = http_request
+    elseif typeof(request) == "function" then
+        http_impl = request
+    else
+        http_impl = function(opt)
+            local ok, res = pcall(function() return HttpService:RequestAsync(opt) end)
+            if not ok then return {Success=false, Body=tostring(res)} end
+            return res
+        end
+    end
+
+    ----------------------------------------------------------------
+    -- POPUP / TOAST
+    ----------------------------------------------------------------
+    local popupGui = Instance.new("ScreenGui")
+    popupGui.Name = "PopupGui"
+    popupGui.ResetOnSpawn = false
+    popupGui.Parent = playerGui
+
+    local popupContainer = Instance.new("Frame")
+    popupContainer.Size = UDim2.new(0, 320, 0, 600)
+    popupContainer.Position = UDim2.new(1, -320, 0, 0)
+    popupContainer.BackgroundTransparency = 1
+    popupContainer.Parent = popupGui
+    popupContainer.ClipsDescendants = false
+
+    local function splitTextToLines(text, charsPerLine)
+        local lines = {}
+        local startPos = 1
+        text = tostring(text or "")
+        while startPos <= #text do
+            table.insert(lines, text:sub(startPos, startPos + charsPerLine - 1))
+            startPos = startPos + charsPerLine
+        end
+        return table.concat(lines, "\n")
+    end
+
+    local function createPopup(msg, icon, duration)
+        icon = icon or "⚙️"
+        duration = duration or 3
+
+        local popup = Instance.new("Frame")
+        popup.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+        popup.BorderSizePixel = 0
+        popup.AnchorPoint = Vector2.new(0, 0)
+        popup.Position = UDim2.new(1, 10, 0, 0)
+        popup.Parent = popupContainer
+        popup.ClipsDescendants = true
+
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 12)
+        corner.Parent = popup
+
+        local uiStroke = Instance.new("UIStroke")
+        uiStroke.Thickness = 2
+        uiStroke.Color = Color3.fromRGB(200, 200, 200)
+        uiStroke.Transparency = 0.5
+        uiStroke.Parent = popup
+
+        local lines = splitTextToLines(msg, 30)
+        local label = Instance.new("TextLabel")
+        label.Size = UDim2.new(1, -10, 1, -10)
+        label.Position = UDim2.new(0, 5, 0, 5)
+        label.BackgroundTransparency = 1
+        label.Text = icon.." "..lines
+        label.TextColor3 = Color3.fromRGB(255, 255, 255)
+        label.TextSize = 15
+        label.Font = Enum.Font.Fantasy
+        label.TextWrapped = true
+        label.TextXAlignment = Enum.TextXAlignment.Left
+        label.TextYAlignment = Enum.TextYAlignment.Top
+        label.Parent = popup
+
+        local lineCount = select(2, lines:gsub("\n","")) + 1
+        popup.Size = UDim2.new(0, 300, 0, 16*lineCount + 20)
+
+        TweenService:Create(popup, TweenInfo.new(0.3, Enum.EasingStyle.Quad), {
+            Position = UDim2.new(1, -310, 0, 0)
+        }):Play()
+
+        task.delay(duration, function()
+            TweenService:Create(popup, TweenInfo.new(0.3, Enum.EasingStyle.Quad), {
+                Position = UDim2.new(1, 10, 0, 0)
+            }):Play()
+            task.wait(0.30)
+            popup:Destroy()
+        end)
+    end
+
+    ----------------------------------------------------------------
+    -- MONEY FILTER (parse + format)
+    ----------------------------------------------------------------
+    local function parseMoneyInput(value)
+        local s = tostring(value or ""):gsub("%s+", "")
+        if s == "" then return 0 end
+        local up = s:upper()
+
+        local numPart, suffix = up:match("%$?([%d%.]+)%s*([KMB])%s*/%s*S")
+        if not numPart then
+            numPart, suffix = up:match("^([%d%.]+)%s*([KMB]?)$")
+        end
+
+        local n = tonumber(numPart)
+        if not n then return 0 end
+
+        local mult = 1
+        if suffix == "K" then mult = 1e3
+        elseif suffix == "M" then mult = 1e6
+        elseif suffix == "B" then mult = 1e9 end
+        return n * mult
+    end
+
+    local function formatMoney(val)
+        val = tonumber(val) or 0
+        if val >= 1e9 then
+            return string.format("$%.2fB/s", val / 1e9)
+        elseif val >= 1e6 then
+            return string.format("$%.2fM/s", val / 1e6)
+        elseif val >= 1e3 then
+            return string.format("$%.2fK/s", val / 1e3)
+        else
+            return "$" .. tostring(math.floor(val)) .. "/s"
+        end
+    end
+
+    _G.minMoneyFilter = 10e6
+
+    ----------------------------------------------------------------
+    -- ✅ ICON DETECTOR (💎 / 🌈)
+    ----------------------------------------------------------------
+    local DIAMOND_SIGNS = { "💎", "🔹", "🔷", "♦", "◆" }
+    local RAINBOW_SIGNS = { "🌈" }
+
+    local function strHasAny(s, arr)
+        if not s or s == "" then return false end
+        for _, x in ipairs(arr) do
+            if s:find(x, 1, true) then return true end
+        end
+        return false
+    end
+
+    local function detectIconType(it)
+        if type(it) ~= "table" then return nil end
+
+        if type(it.is_rainbow) == "boolean" and it.is_rainbow then return "rainbow" end
+        if type(it.is_diamond) == "boolean" and it.is_diamond then return "diamond" end
+
+        local function scanValue(v)
+            local s = tostring(v or "")
+            if strHasAny(s, RAINBOW_SIGNS) then return "rainbow" end
+            if strHasAny(s, DIAMOND_SIGNS) then return "diamond" end
+            local sl = string.lower(s)
+            if sl:find("rainbow", 1, true) then return "rainbow" end
+            if sl:find("diamond", 1, true) then return "diamond" end
+            return nil
+        end
+
+        local raw = it.icon or it.icon_type or it.type or it.rarity or it.variant or it.tag or it.kind
+        local hit = scanValue(raw)
+        if hit then return hit end
+
+        hit = scanValue(it.name or "")
+        if hit then return hit end
+
+        hit = scanValue(it.icon_text or it.display or it.label or "")
+        if hit then return hit end
+
+        local ok, blob = pcall(function()
+            return HttpService:JSONEncode(it)
+        end)
+        if ok and type(blob) == "string" then
+            local h = scanValue(blob)
+            if h then return h end
+        end
+
+        return nil
+    end
+
+    ----------------------------------------------------------------
+    -- TELEPORT JOIN + RETRY
+    ----------------------------------------------------------------
+    local joinedJobIds = {}
+    local retryState = {}
+    local badJobIds = {}
+
+    local function isRestrictedError(err)
+        local s = string.lower(tostring(err or ""))
+        return s:find("773", 1, true) ~= nil
+            or s:find("restricted", 1, true) ~= nil
+            or s:find("not allowed", 1, true) ~= nil
+    end
+
+    local function joinJob(jobId)
+        jobId = tostring(jobId or "")
+        if jobId == "" then return false, "No JobId" end
+        if badJobIds[jobId] then
+            return false, "Blacklisted JobId (restricted/dead)"
+        end
+
+        local ok, err = pcall(function()
+            TeleportService:TeleportToPlaceInstance(PLACE_ID, jobId, player)
+        end)
+
+        if ok then
+            return true, "Teleporting..."
+        end
+
+        local msg = tostring(err)
+        if isRestrictedError(msg) then
+            badJobIds[jobId] = true
+            retryState[jobId] = nil
+            return false, "Restricted (773) -> blacklisted"
+        end
+        return false, msg
+    end
+
+    local function scheduleRetry(jobId)
+        jobId = tostring(jobId or "")
+        if jobId == "" then return end
+        if badJobIds[jobId] then return end
+
+        retryState[jobId] = retryState[jobId] or { next = 0, tries = 0 }
+        retryState[jobId].tries = (retryState[jobId].tries or 0) + 1
+        retryState[jobId].next = tick() + RETRY_SECONDS
+    end
+
+    ----------------------------------------------------------------
+    -- ✅ API HELPERS (FIX: add since/wait/heartbeat)
+    ----------------------------------------------------------------
+    local sinceTs = 0
+
+    local function apiGet(path)
+        local base = tostring(API_BASE or "")
+        if base:sub(-1) == "/" then
+            base = base:sub(1, -2)
+        end
+
+        local url = base .. tostring(path or "")
+
+        local res = http_impl({
+            Url = url,
+            Method = "GET",
+            Headers = {
+                ["Accept"] = "application/json",
+                ["User-Agent"] = "FELLINGClient"
+            }
+        })
+
+        if not res or not res.Body then
+            return nil, "No response body"
+        end
+
+        local code = tonumber(res.StatusCode) or 0
+        local okSuccess = (res.Success == true) or (code >= 200 and code < 300)
+
+        if not okSuccess then
+            return nil, "HTTP " .. tostring(code) .. ": " .. tostring(res.Body)
+        end
+
+        local ok, data = pcall(function()
+            return HttpService:JSONDecode(res.Body)
+        end)
+        if not ok then
+            return nil, "JSON decode fail: " .. tostring(data)
+        end
+
+        return data, nil
+    end
+
+    local function apiHealth()
+        local data, err = apiGet("/health")
+        if not data then return false, err end
+        if data.ok == true then return true, nil end
+        return false, "health not ok"
+    end
+
+    local function apiItemsSimple(limit, min_money, since, wait, heartbeat)
+        limit = tonumber(limit) or 15
+        min_money = tonumber(min_money) or 0
+        since = tonumber(since) or 0
+        wait = tonumber(wait) or 25
+        heartbeat = tonumber(heartbeat) or 5
+
+        local path = string.format(
+            "/items/simple?limit=%d&min_money=%d&since=%s&wait=%d&heartbeat=%d",
+            limit,
+            math.floor(min_money),
+            tostring(since),
+            math.floor(wait),
+            math.floor(heartbeat)
+        )
+        return apiGet(path)
+    end
+
+    ----------------------------------------------------------------
+    -- DEDUPE (seen)
+    ----------------------------------------------------------------
+    local seenKeys = {}
+    local function makeKey(it)
+        local msgid = it.msg_id or it.message_id
+        if msgid and tostring(msgid) ~= "" then
+            return "m:" .. tostring(msgid)
+        end
+        local jid = it.jobid or it.job_id or ""
+        local ca = it.created_at or it.time or ""
+        return "j:" .. tostring(jid) .. "|" .. tostring(ca)
+    end
+
+    ----------------------------------------------------------------
+    -- GUI
+    ----------------------------------------------------------------
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "FELLING Finder"
+    gui.ResetOnSpawn = false
+    gui.Parent = playerGui
+
+    local THEME = {
+        panel  = Color3.fromRGB(14, 18, 28),
+        panel2 = Color3.fromRGB(18, 22, 34),
+        panel3 = Color3.fromRGB(10, 14, 22),
+
+        text   = Color3.fromRGB(220, 240, 255),
+        muted  = Color3.fromRGB(150, 170, 190),
+
+        cyan   = Color3.fromRGB(0, 255, 255),
+        red    = Color3.fromRGB(255, 60, 60),
+        green  = Color3.fromRGB(120, 255, 120),
+
+        chipOff = Color3.fromRGB(12, 38, 50),
+        chipOn  = Color3.fromRGB(0, 255, 255),
+    }
+
+    local GAP = 16
+    local ROOT_H = 400
+    local PANEL_H = 382
+
+    local LEFT_W  = 280
+    local MID_W   = 340
+    local RIGHT_W = 360
+
+    local ROOT_W = LEFT_W + MID_W + RIGHT_W + GAP * 2
+
+    local function corner(inst, r)
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0, r)
+        c.Parent = inst
+        return c
+    end
+
+    local function mkText(parent, txt, size, align, bold)
+        local t = Instance.new("TextLabel")
+        t.BackgroundTransparency = 1
+        t.Text = txt
+        t.TextColor3 = THEME.text
+        t.TextSize = size
+        t.Font = Enum.Font.Fantasy
+        t.TextXAlignment = align or Enum.TextXAlignment.Left
+        t.Parent = parent
+        return t
+    end
+
+    local function autoTextSize(btn, min, max)
+        btn.TextScaled = true
+        btn.TextSize = max
+        local c = Instance.new("UITextSizeConstraint")
+        c.MinTextSize = min
+        c.MaxTextSize = max
+        c.Parent = btn
+    end
+
+    local function addBgGlowAndHover(btn, glowColor)
+        local gcol = glowColor or THEME.cyan
+        local s = btn:FindFirstChildOfClass("UIStroke") or Instance.new("UIStroke")
+        s.Thickness = 1.2
+        s.Color = gcol
+        s.Transparency = 0.15
+        s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+        s.Parent = btn
+
+        btn.MouseEnter:Connect(function()
+            TweenService:Create(s, TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+                Transparency = 0,
+                Thickness = 1.8,
+            }):Play()
+        end)
+
+        btn.MouseLeave:Connect(function()
+            TweenService:Create(s, TweenInfo.new(0.16, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+                Transparency = 0.15,
+                Thickness = 1.2,
+            }):Play()
+        end)
+    end
+
+    local function neonStrokeRunning(inst, thickness, col)
+        local s = Instance.new("UIStroke")
+        s.Thickness = thickness
+        s.Color = col
+        s.Transparency = 0
+        s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+        s.Parent = inst
+
+        local g = Instance.new("UIGradient")
+        g.Rotation = 0
+        g.Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0.00, col),
+            ColorSequenceKeypoint.new(0.50, Color3.fromRGB(255, 255, 255)),
+            ColorSequenceKeypoint.new(1.00, col),
+        })
+        g.Parent = s
+
+        task.spawn(function()
+            while inst.Parent do
+                g.Offset = Vector2.new((tick() * 0.8) % 2 - 1, 0)
+                task.wait(0.03)
+            end
+        end)
+
+        return s
+    end
+
+    local function mkButton(parent, txt, h, glowColor)
+        local b = Instance.new("TextButton")
+        b.AutoButtonColor = false
+        b.BackgroundColor3 = THEME.panel2
+        b.Text = txt
+        b.TextColor3 = THEME.text
+        b.Font = Enum.Font.Fantasy
+        b.TextSize = 16
+        b.Size = UDim2.new(1, 0, 0, h or 40)
+        b.Parent = parent
+        corner(b, 10)
+        autoTextSize(b, 10, 16)
+        addBgGlowAndHover(b, glowColor)
+        return b
+    end
+
+    local function mkNeonGlowButton(parent, txt, h, glowColor)
+        local b = mkButton(parent, txt, h, glowColor)
+        neonStrokeRunning(b, 2, glowColor or THEME.cyan)
+        return b
+    end
+
+    local function mkClose(parent)
+        local b = Instance.new("TextButton")
+        b.AutoButtonColor = false
+        b.Size = UDim2.fromOffset(32, 32)
+        b.BackgroundTransparency = 1
+        b.Text = "X"
+        b.TextColor3 = THEME.text
+        b.TextSize = 22
+        b.Font = Enum.Font.Fantasy
+        b.Parent = parent
+        return b
+    end
+
+    local function addNeonScanToTitle(ttl)
+        ttl.TextColor3 = Color3.fromRGB(255, 255, 255)
+        local tg = Instance.new("UIGradient")
+        tg.Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0.00, Color3.fromRGB(0, 255, 255)),
+            ColorSequenceKeypoint.new(0.50, Color3.fromRGB(255, 255, 255)),
+            ColorSequenceKeypoint.new(1.00, Color3.fromRGB(0, 255, 255)),
+        })
+        tg.Rotation = 0
+        tg.Parent = ttl
+
+        task.spawn(function()
+            while ttl.Parent do
+                tg.Offset = Vector2.new((tick() * 0.8) % 2 - 1, 0)
+                task.wait(0.03)
+            end
+        end)
+    end
+
+    local function mkPanel(parent, size, pos, title)
+        local f = Instance.new("Frame")
+        f.Size = size
+        f.Position = pos
+        f.BackgroundColor3 = THEME.panel
+        f.Parent = parent
+        corner(f, 18)
+
+        local outStroke = Instance.new("UIStroke")
+        outStroke.Thickness = 2
+        outStroke.Color = THEME.cyan
+        outStroke.Transparency = 0
+        outStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+        outStroke.Parent = f
+
+        local header = Instance.new("Frame")
+        header.Name = "Header"
+        header.BackgroundTransparency = 1
+        header.Size = UDim2.new(1, -18, 0, 42)
+        header.Position = UDim2.fromOffset(9, 9)
+        header.Parent = f
+
+        local ttl = mkText(header, title, 18, Enum.TextXAlignment.Left, true)
+        ttl.Size = UDim2.new(1, -210, 1, 0)
+        ttl.Position = UDim2.fromOffset(6, 0)
+        ttl.ZIndex = 2
+
+        local closeBtn = mkClose(header)
+        closeBtn.Position = UDim2.new(1, -40, 0, 2)
+        closeBtn.ZIndex = 60
+
+        local body = Instance.new("ScrollingFrame")
+        body.Name = "Body"
+        body.BackgroundTransparency = 1
+        body.Size = UDim2.new(1, -18, 1, -60)
+        body.Position = UDim2.fromOffset(9, 51)
+        body.BorderSizePixel = 0
+        body.ScrollBarThickness = 4
+        body.ScrollingEnabled = true
+        body.ElasticBehavior = Enum.ElasticBehavior.WhenScrollable
+        body.CanvasSize = UDim2.new(0, 0, 0, 0)
+        body.Parent = f
+
+        return f, header, body, closeBtn, ttl
+    end
+
+    ----------------------------------------------------------------
+    -- ROOT + DRAG
+    ----------------------------------------------------------------
+    local root = Instance.new("Frame")
+    root.BackgroundTransparency = 1
+    root.Size = UDim2.new(0, ROOT_W, 0, ROOT_H)
+    root.Position = UDim2.new(0.5, -ROOT_W/2, 0.60, -ROOT_H/2)
+    root.Parent = gui
+
+    local dragging = false
+    local dragStart = nil
+    local startPos = nil
+    local dragTouchId = nil
+
+    local function hookDrag(handle)
+        handle.InputBegan:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1 then
+                dragging = true
+                dragStart = input.Position
+                startPos = root.Position
+                dragTouchId = nil
+            elseif input.UserInputType == Enum.UserInputType.Touch then
+                dragging = true
+                dragStart = input.Position
+                startPos = root.Position
+                dragTouchId = input.TouchId
+            end
+        end)
+
+        handle.InputEnded:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1 then
+                dragging = false
+            elseif input.UserInputType == Enum.UserInputType.Touch then
+                if dragTouchId == input.TouchId then
+                    dragging = false
+                    dragTouchId = nil
+                end
+            end
+        end)
+    end
+
+    UserInputService.InputChanged:Connect(function(input)
+        if not dragging then return end
+        if not dragStart or not startPos then return end
+
+        local delta = input.Position - dragStart
+        if input.UserInputType == Enum.UserInputType.MouseMovement then
+            root.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y
+            )
+        elseif input.UserInputType == Enum.UserInputType.Touch then
+            if dragTouchId and input.TouchId ~= dragTouchId then return end
+            root.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y
+            )
+        end
+    end)
+
+    local function tweenPanel(panel, show, hiddenOffsetX)
+        panel.Visible = true
+        local targetPos = panel.Position
+        local hiddenPos = UDim2.new(targetPos.X.Scale, targetPos.X.Offset + hiddenOffsetX, targetPos.Y.Scale, targetPos.Y.Offset)
+
+        local function setFade(alpha)
+            for _, d in ipairs(panel:GetDescendants()) do
+                if d:IsA("TextLabel") or d:IsA("TextButton") or d:IsA("TextBox") then
+                    d.TextTransparency = alpha
+                end
+                if d:IsA("UIStroke") then
+                    d.Transparency = math.clamp(alpha, 0, 1)
+                end
+            end
+        end
+
+        if show then
+            panel.Position = hiddenPos
+            setFade(1)
+            TweenService:Create(panel, TweenInfo.new(0.34, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), { Position = targetPos }):Play()
+            local t0 = tick()
+            task.spawn(function()
+                while tick() - t0 < 0.26 do
+                    local a = 1 - ((tick() - t0) / 0.26)
+                    setFade(math.clamp(a, 0, 1))
+                    task.wait()
+                end
+                setFade(0)
+            end)
+        else
+            local t0 = tick()
+            task.spawn(function()
+                while tick() - t0 < 0.18 do
+                    local a = ((tick() - t0) / 0.18)
+                    setFade(math.clamp(a, 0, 1))
+                    task.wait()
+                end
+                setFade(1)
+            end)
+            local tw = TweenService:Create(panel, TweenInfo.new(0.26, Enum.EasingStyle.Quart, Enum.EasingDirection.In), { Position = hiddenPos })
+            tw:Play()
+            tw.Completed:Connect(function()
+                panel.Visible = false
+                panel.Position = targetPos
+                setFade(0)
+            end)
+        end
+    end
+
+    ----------------------------------------------------------------
+    -- CREATE 3 PANELS
+    ----------------------------------------------------------------
+    local leftX = 0
+    local midX = leftX + LEFT_W + GAP
+    local rightX = midX + MID_W + GAP
+
+    local left, leftHeader, leftBody, leftClose =
+        mkPanel(root, UDim2.fromOffset(LEFT_W, PANEL_H), UDim2.fromOffset(leftX, 8), "Filters")
+
+    local mid, midHeader, midBody, midClose, midTitle =
+        mkPanel(root, UDim2.fromOffset(MID_W, PANEL_H), UDim2.fromOffset(midX, 8), "FELLING Finder")
+
+    local right, rightHeader, rightBody, rightClose =
+        mkPanel(root, UDim2.fromOffset(RIGHT_W, PANEL_H), UDim2.fromOffset(rightX, 8), "Blacklist Names")
+
+    hookDrag(midHeader)
+    addNeonScanToTitle(midTitle)
+
+    left.Visible = false
+    right.Visible = false
+
+    local filterBtn = mkNeonGlowButton(midHeader, "🔍 Filter", 26, THEME.cyan)
+    filterBtn.Size = UDim2.fromOffset(92, 26)
+    filterBtn.Position = UDim2.new(1, -144, 0, 8)
+    filterBtn.ZIndex = 60
+
+    ----------------------------------------------------------------
+    -- LEFT CONTENT
+    ----------------------------------------------------------------
+    local blacklistBtn
+    local autoJoinBtn
+    local autoFinderBtn
+    local tier10
+    local tier50
+    local tier100
+    local minBox
+
+    do
+        leftBody:ClearAllChildren()
+
+        local pad = Instance.new("UIPadding")
+        pad.PaddingLeft = UDim.new(0, 8)
+        pad.PaddingRight = UDim.new(0, 8)
+        pad.PaddingTop = UDim.new(0, 4)
+        pad.PaddingBottom = UDim.new(0, 8)
+        pad.Parent = leftBody
+
+        local v = Instance.new("UIListLayout")
+        v.FillDirection = Enum.FillDirection.Vertical
+        v.SortOrder = Enum.SortOrder.LayoutOrder
+        v.Padding = UDim.new(0, 10)
+        v.Parent = leftBody
+
+        v:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+            leftBody.CanvasSize = UDim2.fromOffset(0, v.AbsoluteContentSize.Y + 16)
+        end)
+
+        local row = Instance.new("Frame")
+        row.LayoutOrder = 1
+        row.Size = UDim2.new(1, 0, 0, 40)
+        row.BackgroundColor3 = THEME.panel2
+        row.Parent = leftBody
+        corner(row, 10)
+
+        local minLabel = mkText(row, "Min Money:", 16, Enum.TextXAlignment.Left, true)
+        minLabel.Position = UDim2.fromOffset(10, 0)
+        minLabel.Size = UDim2.new(0.55, 0, 1, 0)
+
+        minBox = Instance.new("TextBox")
+        minBox.Size = UDim2.fromOffset(62, 28)
+        minBox.Position = UDim2.new(1, -114, 0.5, -14)
+        minBox.BackgroundColor3 = THEME.panel3
+        minBox.Text = "10"
+        minBox.TextColor3 = THEME.text
+        minBox.TextSize = 16
+        minBox.Font = Enum.Font.Fantasy
+        minBox.ClearTextOnFocus = false
+        minBox.Parent = row
+        corner(minBox, 8)
+
+        local suf = mkText(row, "M/s", 14, Enum.TextXAlignment.Left, true)
+        suf.Position = UDim2.new(1, -48, 0.5, -10)
+        suf.Size = UDim2.fromOffset(40, 20)
+
+        blacklistBtn = mkButton(leftBody, "Blacklist Names  >", 40, THEME.cyan)
+        blacklistBtn.LayoutOrder = 2
+
+        autoJoinBtn = mkButton(leftBody, "Auto Join: OFF", 40, THEME.cyan)
+        autoJoinBtn.LayoutOrder = 3
+
+        autoFinderBtn = mkButton(leftBody, "Auto Finder: OFF", 40, THEME.cyan)
+        autoFinderBtn.LayoutOrder = 4
+
+        local notify = mkText(leftBody, "Notify tiers", 16, Enum.TextXAlignment.Left, true)
+        notify.LayoutOrder = 5
+        notify.Size = UDim2.new(1, 0, 0, 20)
+        notify.TextColor3 = THEME.muted
+
+        tier10 = mkButton(leftBody, "10m", 40, THEME.cyan); tier10.LayoutOrder = 6
+        tier50 = mkButton(leftBody, "50m", 40, THEME.cyan); tier50.LayoutOrder = 7
+        tier100 = mkButton(leftBody, "100m", 40, THEME.cyan); tier100.LayoutOrder = 8
+    end
+
+    ----------------------------------------------------------------
+    -- MID CONTENT
+    ----------------------------------------------------------------
+    local statusLabel
+    local listFrame
+
+    local ROWS = {}
+    local rowData = {}
+
+    local chipState = nil
+    local savedSelected = nil
+
+    ----------------------------------------------------------------
+    -- ICON PRESENCE (for showing chips only when exist)
+    ----------------------------------------------------------------
+    local hasDiamondInList = false
+    local hasRainbowInList = false
+
+    local function applyChipVisual(c)
+        if not c or not c.btn then return end
+        if c.selected then
+            c.btn.BackgroundColor3 = THEME.chipOn
+            c.btn.TextColor3 = Color3.fromRGB(0,0,0)
+        else
+            c.btn.BackgroundColor3 = THEME.chipOff
+            c.btn.TextColor3 = THEME.text
+        end
+    end
+
+    local function updateIconChipsVisibility()
+        if not chipState then return end
+        local cd = chipState["__BLOCK_DIAMOND__"]
+        local cr = chipState["__BLOCK_RAINBOW__"]
+        local diamondSelected = (cd and cd.selected) and true or false
+        local rainbowSelected = (cr and cr.selected) and true or false
+
+        if diamondSelected then
+            if cd and cd.btn then cd.btn.Visible = false end
+            if cr and cr.btn then cr.btn.Visible = hasRainbowInList end
+            return
+        end
+
+        if rainbowSelected then
+            if cr and cr.btn then cr.btn.Visible = false end
+            if cd and cd.btn then cd.btn.Visible = hasDiamondInList end
+            return
+        end
+
+        if cd and cd.btn then cd.btn.Visible = hasDiamondInList end
+        if cr and cr.btn then cr.btn.Visible = hasRainbowInList end
+    end
+
+    local function removeJobRow(jobid)
+        jobid = tostring(jobid or "")
+        if jobid == "" then return end
+        if ROWS[jobid] then
+            pcall(function() ROWS[jobid]:Destroy() end)
+            ROWS[jobid] = nil
+        end
+        rowData[jobid] = nil
+    end
+
+    local function setStatusText(txt, col)
+        if not statusLabel then return end
+        statusLabel.Text = tostring(txt or "")
+        if col then statusLabel.TextColor3 = col end
+    end
+
+    local function isBlockedByChips(name, iconType)
+        if not chipState then return false end
+
+        if iconType == "diamond" and chipState["__BLOCK_DIAMOND__"] and chipState["__BLOCK_DIAMOND__"].selected then
+            return true
+        end
+        if iconType == "rainbow" and chipState["__BLOCK_RAINBOW__"] and chipState["__BLOCK_RAINBOW__"].selected then
+            return true
+        end
+
+        local lower = string.lower(tostring(name or ""))
+        if lower == "" then return false end
+
+        for _, chip in pairs(chipState) do
+            if chip and chip.selected and chip.mode == "name" then
+                local petName = chip.rawName
+                if petName and petName ~= "" then
+                    if string.find(lower, string.lower(petName), 1, true) then
+                        return true
+                    end
+                end
+            end
+        end
+
+        return false
+    end
+
+    local function passMoney(money)
+        money = tonumber(money) or 0
+        return money >= (_G.minMoneyFilter or 1)
+    end
+
+    local autoJoinEnabled = false
+    local autoJoinSkipExisting = false -- ✅ bật AutoJoin: bỏ qua item cũ, chờ item mới
+
+    ----------------------------------------------------------------
+    -- ✅ AUTO JOIN SPAM (ONLY AUTO JOIN, NOT TOUCH MANUAL SPAM JOIN)
+    -- - đang auto spam mà xuất hiện 🌈 mới -> switch qua 🌈 luôn
+    ----------------------------------------------------------------
+    local autoSpam = { running = false, jobid = nil, iconType = nil }
+
+    local function stopAutoSpam(reason)
+        if autoSpam.running then
+            autoSpam.running = false
+            autoSpam.jobid = nil
+            autoSpam.iconType = nil
+            if reason and reason ~= "" then
+                setStatusText(reason, THEME.muted)
+            end
+        end
+    end
+
+    local function startAutoSpam(jid, iconType, statusMsg)
+        jid = tostring(jid or "")
+        if jid == "" then return end
+        if badJobIds[jid] then return end
+
+        stopAutoSpam()
+
+        autoSpam.running = true
+        autoSpam.jobid = jid
+        autoSpam.iconType = iconType
+
+        if statusMsg and statusMsg ~= "" then
+            setStatusText(statusMsg, THEME.green)
+            createPopup(statusMsg, (iconType == "rainbow" and "🌈" or "🚀"), 2)
+        end
+
+        task.spawn(function()
+            while autoSpam.running and autoSpam.jobid == jid and autoJoinEnabled do
+                if badJobIds[jid] then
+                    stopAutoSpam("⛔ AutoJoin: Job bị blacklist -> stop")
+                    break
+                end
+
+                local ok, msg = joinJob(jid)
+
+                task.wait(0.01)
+
+                if game.JobId == jid then
+                    stopAutoSpam("🚀 AutoJoin: Joined " .. jid)
+                    createPopup("AutoJoin Joined: "..jid, "🚀", 2)
+                    break
+                end
+
+                if not ok then
+                    local low = string.lower(tostring(msg))
+                    if low:find("restricted", 1, true) or low:find("773", 1, true) then
+                        stopAutoSpam("⛔ AutoJoin: Restricted -> stop")
+                        createPopup("Restricted -> stop auto: "..jid, "⛔", 3)
+                        break
+                    end
+                end
+
+                task.wait(0.05)
+            end
+        end)
+    end
+
+    local function cleanupExtraRows()
+        local arr = {}
+        for jid, row in pairs(ROWS) do
+            if row and row.Parent then
+                table.insert(arr, {jid=jid, order=row.LayoutOrder})
+            end
+        end
+        table.sort(arr, function(a,b) return a.order < b.order end)
+
+        while #arr > MAX_ROWS do
+            local last = table.remove(arr)
+            if last and last.jid then
+                removeJobRow(last.jid)
+            end
+        end
+    end
+
+    local function refreshRowsByBlacklist()
+        for jid, data in pairs(rowData) do
+            if data and isBlockedByChips(data.name, data.iconType) then
+                removeJobRow(jid)
+            end
+        end
+    end
+
+    ----------------------------------------------------------------
+    -- SPAM JOIN (ONLY WHEN CLICK)  ✅ giữ nguyên
+    ----------------------------------------------------------------
+    local spamJoinState = {} -- [jobId] = {running=true}
+
+    local function stopSpam(jobId)
+        jobId = tostring(jobId or "")
+        if spamJoinState[jobId] then
+            spamJoinState[jobId].running = false
+            spamJoinState[jobId] = nil
+        end
+    end
+
+    ----------------------------------------------------------------
+    -- ✅ ADD/UPDATE ROW (Sort: Rainbow > Diamond > Money)
+    ----------------------------------------------------------------
+    local function addOrUpdateRow(data)
+        if not data then return end
+        local jid = tostring(data.jobid or "")
+        if jid == "" then return end
+
+        if badJobIds[jid] then
+            stopSpam(jid)
+            return
+        end
+        if not passMoney(data.money) then return end
+        if isBlockedByChips(data.name, data.iconType) then
+            stopSpam(jid)
+            return
+        end
+
+        local iconBase = 0
+        if data.iconType == "rainbow" then
+            iconBase = 2000000000
+        elseif data.iconType == "diamond" then
+            iconBase = 1000000000
+        end
+
+        local moneyVal = tonumber(data.money) or 0
+        if moneyVal > 900000000 then moneyVal = 900000000 end
+        local layoutTop = -math.floor(iconBase + moneyVal)
+
+        local baseName = tostring(data.name or "Unknown")
+        local iconPrefix = ""
+        if data.iconType == "rainbow" then iconPrefix = "🌈 "
+        elseif data.iconType == "diamond" then iconPrefix = "💎 " end
+
+        if ROWS[jid] and ROWS[jid].Parent then
+            rowData[jid] = data
+            local row = ROWS[jid]
+
+            local nm = row:FindFirstChild("NM")
+            local mv = row:FindFirstChild("MV")
+            if nm then nm.Text = iconPrefix .. baseName end
+            if mv then mv.Text = formatMoney(tonumber(data.money) or 0) end
+            row.LayoutOrder = layoutTop
+
+            cleanupExtraRows()
+            return
+        end
+
+        rowData[jid] = data
+
+        local row = Instance.new("Frame")
+        row.Size = UDim2.new(1, -8, 0, 86)
+        row.BackgroundColor3 = THEME.panel2
+        row.Parent = listFrame
+        corner(row, 12)
+        row.LayoutOrder = layoutTop
+
+        local nm = mkText(row, iconPrefix .. baseName, 16, Enum.TextXAlignment.Left, true)
+        nm.Name = "NM"
+        nm.Position = UDim2.fromOffset(12, 10)
+        nm.Size = UDim2.new(1, -24, 0, 22)
+
+        local mv = mkText(row, formatMoney(tonumber(data.money) or 0), 16, Enum.TextXAlignment.Right, true)
+        mv.Name = "MV"
+        mv.TextColor3 = Color3.fromRGB(140, 255, 140)
+        mv.AnchorPoint = Vector2.new(1, 0)
+        mv.Position = UDim2.new(1, -12, 0, 10)
+        mv.Size = UDim2.fromOffset(170, 22)
+
+        local div = Instance.new("Frame")
+        div.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+        div.BackgroundTransparency = 0.92
+        div.BorderSizePixel = 0
+        div.Size = UDim2.new(1, -20, 0, 1)
+        div.Position = UDim2.fromOffset(10, 40)
+        div.Parent = row
+
+        local btnRow = Instance.new("Frame")
+        btnRow.BackgroundTransparency = 1
+        btnRow.Size = UDim2.new(1, -20, 0, 34)
+        btnRow.Position = UDim2.fromOffset(10, 48)
+        btnRow.Parent = row
+
+        local joinBtn = mkButton(btnRow, "JOIN", 34, THEME.cyan)
+        joinBtn.Size = UDim2.new(0.5, -5, 1, 0)
+        joinBtn.Position = UDim2.new(0, 0, 0, 0)
+        joinBtn.BackgroundColor3 = THEME.cyan
+        joinBtn.TextColor3 = Color3.fromRGB(0, 0, 0)
+
+        local spamBtn = mkButton(btnRow, "SPAM JOIN", 34, THEME.cyan)
+        spamBtn.Size = UDim2.new(0.5, -5, 1, 0)
+        spamBtn.Position = UDim2.new(0.5, 5, 0, 0)
+        spamBtn.BackgroundColor3 = THEME.panel3
+        spamBtn.TextColor3 = THEME.text
+
+        local function setSpamVisual(running)
+            if running then
+                spamBtn.Text = "STOP"
+                spamBtn.BackgroundColor3 = THEME.cyan
+                spamBtn.TextColor3 = Color3.fromRGB(0,0,0)
+            else
+                spamBtn.Text = "SPAM JOIN"
+                spamBtn.BackgroundColor3 = THEME.panel3
+                spamBtn.TextColor3 = THEME.text
+            end
+        end
+
+        joinBtn.MouseButton1Click:Connect(function()
+            local ok, msg = joinJob(jid)
+            if ok then
+                setStatusText("✅ Joining: " .. jid, THEME.green)
+                createPopup("Teleport: " .. jid, "✅", 2)
+                stopSpam(jid)
+                setSpamVisual(false)
+            else
+                setStatusText("❌ Join failed: " .. tostring(msg), THEME.red)
+                createPopup("Join failed: " .. tostring(msg), "❌", 3)
+            end
+        end)
+
+        spamBtn.MouseButton1Click:Connect(function()
+            local st = spamJoinState[jid]
+            if st and st.running then
+                stopSpam(jid)
+                setSpamVisual(false)
+                createPopup("Stopped spam: "..jid, "⛔", 2)
+                return
+            end
+
+            spamJoinState[jid] = { running = true }
+            setSpamVisual(true)
+            createPopup("Spamming join: "..jid, "⚡", 2)
+
+            task.spawn(function()
+                while spamJoinState[jid] and spamJoinState[jid].running do
+                    if badJobIds[jid] then
+                        stopSpam(jid)
+                        setSpamVisual(false)
+                        break
+                    end
+
+                    local ok, msg = joinJob(jid)
+                    task.wait(0.1)
+
+                    if game.JobId == tostring(jid) then
+                        stopSpam(jid)
+                        setSpamVisual(false)
+                        setStatusText("🚀 Joined: " .. jid, THEME.green)
+                        createPopup("Joined: "..jid, "🚀", 2)
+                        break
+                    end
+
+                    if not ok then
+                        local low = string.lower(tostring(msg))
+                        if low:find("restricted", 1, true) or low:find("773", 1, true) then
+                            stopSpam(jid)
+                            setSpamVisual(false)
+                            setStatusText("⛔ Restricted -> stop spam: " .. jid, THEME.red)
+                            createPopup("Restricted -> stop spam: "..jid, "⛔", 3)
+                            break
+                        else
+                            setStatusText("⚠️ Spam trying... "..tostring(msg), THEME.muted)
+                        end
+                    end
+
+                    task.wait(0.05)
+                end
+            end)
+        end)
+
+        ROWS[jid] = row
+        cleanupExtraRows()
+    end
+
+    ----------------------------------------------------------------
+    -- MID BODY UI (List + Status)
+    ----------------------------------------------------------------
+    do
+        midBody:ClearAllChildren()
+
+        local pad = Instance.new("UIPadding")
+        pad.PaddingLeft = UDim.new(0, 8)
+        pad.PaddingRight = UDim.new(0, 8)
+        pad.PaddingTop = UDim.new(0, 4)
+        pad.PaddingBottom = UDim.new(0, 8)
+        pad.Parent = midBody
+
+        local v = Instance.new("UIListLayout")
+        v.FillDirection = Enum.FillDirection.Vertical
+        v.SortOrder = Enum.SortOrder.LayoutOrder
+        v.Padding = UDim.new(0, 10)
+        v.Parent = midBody
+
+        v:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+            midBody.CanvasSize = UDim2.fromOffset(0, v.AbsoluteContentSize.Y + 16)
+        end)
+
+        statusLabel = mkText(midBody, "Status: ...", 14, Enum.TextXAlignment.Left, true)
+        statusLabel.Size = UDim2.new(1, 0, 0, 20)
+        statusLabel.TextColor3 = THEME.muted
+
+        listFrame = Instance.new("Frame")
+        listFrame.BackgroundTransparency = 1
+        listFrame.Size = UDim2.new(1, 0, 1, -30)
+        listFrame.Parent = midBody
+
+        local listLayout = Instance.new("UIListLayout")
+        listLayout.FillDirection = Enum.FillDirection.Vertical
+        listLayout.SortOrder = Enum.SortOrder.LayoutOrder
+        listLayout.Padding = UDim.new(0, 10)
+        listLayout.Parent = listFrame
+    end
+
+    ----------------------------------------------------------------
+    -- RIGHT CONTENT (BLACKLIST)
+    ----------------------------------------------------------------
+    local saved = loadSavedBlacklist()
+    savedSelected = saved.selected or {}
+
+    local function persistNow()
+        if canFileIO() then
+            saveBlacklistSelected(savedSelected)
+        end
+    end
+
+    do
+        local tabs = Instance.new("Frame")
+        tabs.BackgroundTransparency = 1
+        tabs.Size = UDim2.new(1, -10, 0, 38)
+        tabs.Position = UDim2.fromOffset(5, 0)
+        tabs.Parent = rightBody
+
+        local tabA = mkButton(tabs, "💎🌈 Diamond & Rainbow", 34, THEME.cyan)
+        tabA.Size = UDim2.new(0.42, -6, 1, 0)
+        tabA.Position = UDim2.fromOffset(0, 0)
+        tabA.BackgroundColor3 = THEME.cyan
+        tabA.TextColor3 = Color3.fromRGB(0, 0, 0)
+
+        local tabB = mkButton(tabs, "Secret", 34, THEME.cyan)
+        tabB.Size = UDim2.new(0.29, -6, 1, 0)
+        tabB.Position = UDim2.new(0.42, 3, 0, 0)
+
+        local tabC = mkButton(tabs, "OG", 34, THEME.cyan)
+        tabC.Size = UDim2.new(0.29, -6, 1, 0)
+        tabC.Position = UDim2.new(0.71, 6, 0, 0)
+
+        local search = Instance.new("TextBox")
+        search.Size = UDim2.new(1, -10, 0, 34)
+        search.Position = UDim2.fromOffset(5, 46)
+        search.BackgroundColor3 = THEME.panel2
+        search.PlaceholderText = "Search name to BLOCK..."
+        search.Text = ""
+        search.TextColor3 = THEME.text
+        search.TextSize = 14
+        search.Font = Enum.Font.Fantasy
+        search.ClearTextOnFocus = false
+        search.Parent = rightBody
+        corner(search, 10)
+
+        local selAll = mkButton(rightBody, "Block All", 36, THEME.cyan)
+        selAll.Size = UDim2.new(0.60, -8, 0, 36)
+        selAll.Position = UDim2.fromOffset(5, 86)
+        selAll.BackgroundColor3 = THEME.cyan
+        selAll.TextColor3 = Color3.fromRGB(0, 0, 0)
+
+        local clear = mkButton(rightBody, "Unblock All", 36, THEME.cyan)
+        clear.Size = UDim2.new(0.40, -8, 0, 36)
+        clear.Position = UDim2.new(0.60, 3, 0, 86)
+
+        local chips = Instance.new("ScrollingFrame")
+        chips.Size = UDim2.new(1, -10, 1, -132)
+        chips.Position = UDim2.fromOffset(5, 130)
+        chips.BackgroundTransparency = 1
+        chips.BorderSizePixel = 0
+        chips.ScrollBarThickness = 6
+        chips.ScrollingEnabled = true
+        chips.ElasticBehavior = Enum.ElasticBehavior.WhenScrollable
+        chips.Parent = rightBody
+
+        local grid = Instance.new("UIGridLayout")
+        grid.CellPadding = UDim2.fromOffset(10, 10)
+        grid.CellSize = UDim2.new(0.5, -10, 0, 36)
+        grid.Parent = chips
+
+        grid:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+            chips.CanvasSize = UDim2.fromOffset(0, grid.AbsoluteContentSize.Y + 10)
+        end)
+
+        chipState = chipState or {}
+        local activeCategory = "DiamondRainbow"
+
+        local function setTabActive(cat)
+            activeCategory = cat
+            local function styleTab(b, on)
+                b.BackgroundColor3 = on and THEME.cyan or THEME.panel2
+                b.TextColor3 = on and Color3.fromRGB(0, 0, 0) or THEME.text
+            end
+            styleTab(tabA, cat == "DiamondRainbow")
+            styleTab(tabB, cat == "Secret")
+            styleTab(tabC, cat == "OG")
+        end
+
+        local function mkChip(key, displayText, category, mode, rawName)
+            local b = mkButton(chips, displayText, 36, THEME.cyan)
+            b.BackgroundColor3 = THEME.chipOff
+
+            local preSelected = (savedSelected[key] == true)
+
+            local c = {
+                btn = b,
+                key = key,
+                name = displayText,
+                rawName = rawName or displayText,
+                selected = preSelected,
+                category = category,
+                mode = mode
+            }
+            chipState[key] = c
+            applyChipVisual(c)
+
+            b.MouseButton1Click:Connect(function()
+                if key == "__BLOCK_DIAMOND__" then
+                    c.selected = not c.selected
+                    if c.selected and chipState["__BLOCK_RAINBOW__"] then
+                        chipState["__BLOCK_RAINBOW__"].selected = false
+                        savedSelected["__BLOCK_RAINBOW__"] = nil
+                        applyChipVisual(chipState["__BLOCK_RAINBOW__"])
+                    end
+                elseif key == "__BLOCK_RAINBOW__" then
+                    c.selected = not c.selected
+                    if c.selected and chipState["__BLOCK_DIAMOND__"] then
+                        chipState["__BLOCK_DIAMOND__"].selected = false
+                        savedSelected["__BLOCK_DIAMOND__"] = nil
+                        applyChipVisual(chipState["__BLOCK_DIAMOND__"])
+                    end
+                else
+                    c.selected = not c.selected
+                end
+
+                savedSelected[key] = c.selected and true or nil
+                applyChipVisual(c)
+
+                persistNow()
+                refreshRowsByBlacklist()
+                updateIconChipsVisibility()
+            end)
+        end
+
+        mkChip("__BLOCK_DIAMOND__", "💎 Block Diamond", "DiamondRainbow", "icon")
+        mkChip("__BLOCK_RAINBOW__", "🌈 Block Rainbow", "DiamondRainbow", "icon")
+
+        if chipState["__BLOCK_DIAMOND__"] and chipState["__BLOCK_RAINBOW__"] then
+            if chipState["__BLOCK_DIAMOND__"].selected and chipState["__BLOCK_RAINBOW__"].selected then
+                chipState["__BLOCK_RAINBOW__"].selected = false
+                savedSelected["__BLOCK_RAINBOW__"] = nil
+                applyChipVisual(chipState["__BLOCK_RAINBOW__"])
+                persistNow()
+            end
+        end
+
+        local targets = {
+            "Chipso and Queso","La Casa Boo","Tang Tang Keletang","Headless Horseman",
+            "Chicleteira Bicicleteira","Los Chicleteiras",
+            "La Grande Combinasion","Nuclearo Dinossauro","Esok Sekolah","Ketupat Kepat",
+            "Money Money Puggy","Tictac Sahur","Ketchuru and Musturu","Garama and Madundung",
+            "Spaghetti Tualetti","Dragon Cannelloni","67","Mariachi Corazoni","Tacorita Bicicleta",
+            "La Extinct Grande","Las Sis",
+            "Celularcini Viciosini","Los Bros","Tralaledon","Los Tacoritas","Los Primos",
+            "Chillin Chili","Los Combinasionas","Los Hotspotsitos","La Supreme Combinasion",
+            "Los 67","La Secret Combinasion","Burguro And Fryuro","La Spooky Grande","Los Mobilis",
+            "Eviledon","Spooky and Pumpky","Mieteteira Bicicleteira","Los Spooky Combinasionas",
+            "Los Matteos","Bisonte Guppitere","La Vacca Saturno Saturnita","Los Spiderinis","Los Tralaleritos",
+            "Yess My Examine","Las Tralaleritas","Job Job Job Sahur","Las Vaquitas Saturnitas","1x1x1x1","Guest 666",
+            "Captiano Moby","La Taco Combinasion","Los Puggies","Los Spaghettis","Fragrama and Chocrama","Orcaledon","Swag Soda",
+            "Chicleteira Noelteira","Festive 67","Cooki and Milki","La Jolly Grande","Los 25","List List List Sahur","Santa Hotspot","Pot Hotspot",
+            "Los Candies","Los Cucarachas","Naughty Naughty","To to to Sahur","Graipuss Medussi","Los Quesadillas","Triplito Tralaleritos","Chimnino","Los Tortus","Quesadilla Crocodila",
+            "Burrito Bandito","Los Burritos","Ho Ho Ho Sahur","Los Nooo My Hotspotsitos","Noo my Present","Pirulitoita Bicicleteira","Trickolino","Giftini Spyderini","Pumpkini Spyderini",
+            "Tung Tung Tung Sahur","Horegini Boom","Chicleteirina Bicicleteirina","Pot Pumpkin","Tuff Toucan","Brunito Marsito","Los Jobcitos","La Sahur Combinasion","Telemorte",
+        }
+        for _, n in ipairs(targets) do
+            mkChip("S:"..n, n, "Secret", "name", n)
+        end
+        for _, n in ipairs({"Strawberry Elephant","Meowl"}) do
+            mkChip("O:"..n, n, "OG", "name", n)
+        end
+
+        local function refreshChips()
+            local q = string.lower(search.Text or "")
+
+            for _, c in pairs(chipState) do
+                local visible = (c.category == activeCategory)
+
+                if visible then
+                    if activeCategory ~= "DiamondRainbow" then
+                        visible = (q == "" or string.find(string.lower(c.name), q, 1, true) ~= nil)
+                        c.btn.Visible = visible
+                    else
+                        if c.key ~= "__BLOCK_DIAMOND__" and c.key ~= "__BLOCK_RAINBOW__" then
+                            c.btn.Visible = true
+                        end
+                    end
+                else
+                    c.btn.Visible = false
+                end
+            end
+
+            if activeCategory == "DiamondRainbow" then
+                updateIconChipsVisibility()
+            end
+        end
+
+        search:GetPropertyChangedSignal("Text"):Connect(refreshChips)
+        tabA.MouseButton1Click:Connect(function() setTabActive("DiamondRainbow"); refreshChips() end)
+        tabB.MouseButton1Click:Connect(function() setTabActive("Secret"); refreshChips() end)
+        tabC.MouseButton1Click:Connect(function() setTabActive("OG"); refreshChips() end)
+
+        selAll.MouseButton1Click:Connect(function()
+            for _, c in pairs(chipState) do
+                if c.category == activeCategory then
+                    if activeCategory == "DiamondRainbow" then
+                        if chipState["__BLOCK_DIAMOND__"] then
+                            chipState["__BLOCK_DIAMOND__"].selected = true
+                            savedSelected["__BLOCK_DIAMOND__"] = true
+                            applyChipVisual(chipState["__BLOCK_DIAMOND__"])
+                        end
+                        if chipState["__BLOCK_RAINBOW__"] then
+                            chipState["__BLOCK_RAINBOW__"].selected = false
+                            savedSelected["__BLOCK_RAINBOW__"] = nil
+                            applyChipVisual(chipState["__BLOCK_RAINBOW__"])
+                        end
+                        break
+                    else
+                        c.selected = true
+                        savedSelected[c.key] = true
+                        applyChipVisual(c)
+                    end
+                end
+            end
+            persistNow()
+            refreshRowsByBlacklist()
+            updateIconChipsVisibility()
+        end)
+
+        clear.MouseButton1Click:Connect(function()
+            for _, c in pairs(chipState) do
+                if c.category == activeCategory then
+                    c.selected = false
+                    savedSelected[c.key] = nil
+                    applyChipVisual(c)
+                end
+            end
+            persistNow()
+            refreshRowsByBlacklist()
+            updateIconChipsVisibility()
+        end)
+
+        setTabActive("DiamondRainbow")
+        refreshChips()
+        updateIconChipsVisibility()
+
+        if canFileIO() then
+            createPopup("✅ Blacklist Saved: "..SAVE_FILE, "💾", 3)
+        else
+            createPopup("⚠️ Executor không có readfile/writefile -> blacklist KHÔNG lưu", "⚠️", 4)
+        end
+    end
+
+    ----------------------------------------------------------------
+    -- LOGIC: AutoJoin / Tier
+    ----------------------------------------------------------------
+    local autoFinder = false
+    local tierSelected = nil
+
+    local function setAutoJoin(on)
+        autoJoinEnabled = on
+        autoJoinBtn.Text = on and "Auto Join: ON" or "Auto Join: OFF"
+        autoJoinBtn.BackgroundColor3 = on and THEME.cyan or THEME.panel2
+        autoJoinBtn.TextColor3 = on and Color3.fromRGB(0,0,0) or THEME.text
+
+        if on then
+            autoJoinSkipExisting = true
+            setStatusText("⏳ Auto Join: ON (chờ item mới)", THEME.green)
+            createPopup("Auto Join ON: SẼ CHỜ ITEM MỚI (không join item cũ)", "⏳", 2)
+        else
+            stopAutoSpam("Auto Join: OFF")
+            setStatusText("Auto Join: OFF", THEME.muted)
+            createPopup("Auto Join Disabled", "⏸️", 2)
+        end
+    end
+
+    local function setAutoFinder(on)
+        autoFinder = on
+        autoFinderBtn.Text = on and "Auto Finder: ON" or "Auto Finder: OFF"
+        autoFinderBtn.BackgroundColor3 = on and THEME.cyan or THEME.panel2
+        autoFinderBtn.TextColor3 = on and Color3.fromRGB(0,0,0) or THEME.text
+    end
+
+    local function setTier(t)
+        tierSelected = t
+        local function style(b, active)
+            b.BackgroundColor3 = active and THEME.cyan or THEME.panel2
+            b.TextColor3 = active and Color3.fromRGB(0,0,0) or THEME.text
+        end
+        style(tier10, t == "10m")
+        style(tier50, t == "50m")
+        style(tier100, t == "100m")
+
+        if t == "10m" then
+            _G.minMoneyFilter = 10e6
+            minBox.Text = "10"
+        elseif t == "50m" then
+            _G.minMoneyFilter = 50e6
+            minBox.Text = "50"
+        elseif t == "100m" then
+            _G.minMoneyFilter = 100e6
+            minBox.Text = "100"
+        end
+
+        if t then
+            setStatusText("Filter: ≥ " .. t, THEME.muted)
+        end
+    end
+
+    setAutoJoin(false)
+    setAutoFinder(false)
+    setTier("10m")
+
+    autoJoinBtn.MouseButton1Click:Connect(function() setAutoJoin(not autoJoinEnabled) end)
+    autoFinderBtn.MouseButton1Click:Connect(function() setAutoFinder(not autoFinder) end)
+    tier10.MouseButton1Click:Connect(function() setTier(tierSelected == "10m" and nil or "10m") end)
+    tier50.MouseButton1Click:Connect(function() setTier(tierSelected == "50m" and nil or "50m") end)
+    tier100.MouseButton1Click:Connect(function() setTier(tierSelected == "100m" and nil or "100m") end)
+
+    local function applyMinFromBox()
+        local n = tonumber(minBox.Text) or 0
+        if n <= 0 then return end
+        local val = parseMoneyInput(tostring(n) .. "M")
+        if val > 0 then
+            _G.minMoneyFilter = val
+            tierSelected = nil
+            setStatusText("Filter: ≥ " .. formatMoney(val), THEME.muted)
+        end
+    end
+
+    minBox.FocusLost:Connect(function()
+        applyMinFromBox()
+    end)
+
+    ----------------------------------------------------------------
+    -- OPEN/CLOSE PANELS & HOTKEYS
+    ----------------------------------------------------------------
+    local leftOpen = false
+    local rightOpen = false
+
+    filterBtn.MouseButton1Click:Connect(function()
+        leftOpen = not leftOpen
+        tweenPanel(left, leftOpen, -(LEFT_W + 40))
+    end)
+
+    blacklistBtn.MouseButton1Click:Connect(function()
+        rightOpen = not rightOpen
+        tweenPanel(right, rightOpen, (RIGHT_W + 40))
+    end)
+
+    leftClose.MouseButton1Click:Connect(function()
+        if leftOpen then leftOpen = false; tweenPanel(left, false, -(LEFT_W + 40)) end
+    end)
+
+    rightClose.MouseButton1Click:Connect(function()
+        if rightOpen then rightOpen = false; tweenPanel(right, false, (RIGHT_W + 40)) end
+    end)
+
+    midClose.MouseButton1Click:Connect(function()
+        gui:Destroy()
+    end)
+
+    local guiVisible = true
+    UserInputService.InputBegan:Connect(function(input, gp)
+        if gp then return end
+        if input.KeyCode == Enum.KeyCode.T then
+            guiVisible = not guiVisible
+            root.Visible = guiVisible
+        elseif input.KeyCode == Enum.KeyCode.R then
+            setAutoJoin(not autoJoinEnabled)
+        end
+    end)
+
+    ----------------------------------------------------------------
+    -- AUTO JOIN RETRY LOOP (still ok)
+    ----------------------------------------------------------------
+    task.spawn(function()
+        while task.wait(0.2) do
+            if not autoJoinEnabled then
+                continue
+            end
+
+            local now = tick()
+            for jid, st in pairs(retryState) do
+                if badJobIds[jid] then
+                    retryState[jid] = nil
+                elseif now >= (st.next or 0) then
+                    local ok, msg = joinJob(jid)
+                    if ok then
+                        retryState[jid] = nil
+                        joinedJobIds[jid] = true
+                        setStatusText("🚀 Retry OK: " .. jid, THEME.green)
+                        createPopup("Retry OK: "..jid, "🚀", 2)
+                    else
+                        if tostring(msg):lower():find("blacklisted", 1, true) then
+                            retryState[jid] = nil
+                        else
+                            setStatusText("⏳ Retry failed: "..tostring(msg), THEME.red)
+                            scheduleRetry(jid)
+                        end
+                    end
+                end
+            end
+        end
+    end)
+
+    ----------------------------------------------------------------
+    -- ✅ API POLL LOOP
+    ----------------------------------------------------------------
+    task.spawn(function()
+        task.wait(0.6)
+
+        if not API_BASE or API_BASE == "" then
+            setStatusText("❌ Missing API_BASE", THEME.red)
+            createPopup("Bạn chưa điền API_BASE", "❌", 4)
+            return
+        end
+
+        setStatusText("🔄 Checking API /health ...", THEME.muted)
+
+        local okHealth, errHealth = apiHealth()
+        if not okHealth then
+            setStatusText("❌ API offline: " .. tostring(errHealth), THEME.red)
+            createPopup("API offline: "..tostring(errHealth), "❌", 4)
+            return
+        end
+
+        setStatusText("✅ API Connected - Polling /items/simple", THEME.green)
+        createPopup("API Connected", "✅", 2)
+
+        local lastGood = tick()
+
+        while task.wait(POLL_INTERVAL) do
+            local minMoney = tonumber(_G.minMoneyFilter) or 0
+            local data, err = apiItemsSimple(MAX_ROWS * 6, minMoney, sinceTs, 25, 5)
+
+            if not data then
+                if tick() - lastGood > 2.0 then
+                    setStatusText("❌ /items/simple error: " .. tostring(err), THEME.red)
+                end
+                continue
+            end
+
+            if data.ok ~= true then
+                if tick() - lastGood > 2.0 then
+                    setStatusText("❌ /items/simple not ok", THEME.red)
+                end
+                continue
+            end
+
+            lastGood = tick()
+            local items = data.items or {}
+            setStatusText("🟢 Live (API): " .. tostring(#items) .. " items", THEME.muted)
+
+            hasDiamondInList = false
+            hasRainbowInList = false
+
+            local bestByName = {}
+
+            for _, it in ipairs(items) do
+                if type(it) == "table" then
+                    local jid = tostring(it.jobid or it.job_id or "")
+                    local name = tostring(it.name or "Unknown")
+                    local money = tonumber(it.money) or tonumber(it.money_value)
+                    if (not money) or money <= 0 then
+                        money = parseMoneyInput(it.money_text or "")
+                    end
+                    money = tonumber(money) or 0
+
+                    local iconType = detectIconType(it)
+
+                    if iconType == "diamond" then hasDiamondInList = true end
+                    if iconType == "rainbow" then hasRainbowInList = true end
+
+                    if jid ~= "" and name ~= "" then
+                        local nameKey = string.lower(name)
+                        local prev = bestByName[nameKey]
+
+                        if not prev then
+                            bestByName[nameKey] = { jobid=jid, name=name, money=money, iconType=iconType }
+                        else
+                            if prev.iconType ~= "rainbow" and iconType == "rainbow" then
+                                bestByName[nameKey] = { jobid=jid, name=name, money=money, iconType=iconType }
+                            elseif prev.iconType == iconType then
+                                if money > (prev.money or 0) then
+                                    bestByName[nameKey] = { jobid=jid, name=name, money=money, iconType=iconType }
+                                end
+                            else
+                                if (prev.iconType ~= "rainbow") and (iconType ~= "rainbow") then
+                                    if money > (prev.money or 0) then
+                                        bestByName[nameKey] = { jobid=jid, name=name, money=money, iconType=iconType }
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+
+            do
+                for jid, d in pairs(rowData) do
+                    if d and d.name then
+                        local nk = string.lower(tostring(d.name))
+                        local b = bestByName[nk]
+                        if b and b.jobid and tostring(b.jobid) ~= tostring(jid) then
+                            removeJobRow(jid)
+                        end
+                    end
+                end
+            end
+
+            local newCandidates = {}
+
+            for _, it in ipairs(items) do
+                if type(it) == "table" then
+                    local jid = tostring(it.jobid or it.job_id or "")
+                    local name = tostring(it.name or "Unknown")
+                    local money = tonumber(it.money) or tonumber(it.money_value)
+                    if (not money) or money <= 0 then
+                        money = parseMoneyInput(it.money_text or "")
+                    end
+                    money = tonumber(money) or 0
+
+                    local iconType = detectIconType(it)
+                    local nameKey = string.lower(name)
+                    local b = bestByName[nameKey]
+
+                    if b and b.jobid == jid then
+                        local key = makeKey(it)
+                        local isNew = (seenKeys[key] ~= true)
+                        seenKeys[key] = true
+
+                        if jid ~= "" then
+                            addOrUpdateRow({ jobid = jid, name = name, money = money, iconType = iconType })
+
+                            if autoJoinEnabled and (not autoJoinSkipExisting) and isNew and (not joinedJobIds[jid]) and (not badJobIds[jid]) then
+                                if (not isBlockedByChips(name, iconType)) and passMoney(money) then
+                                    table.insert(newCandidates, { jobid = jid, name = name, money = money, iconType = iconType })
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+
+            updateIconChipsVisibility()
+
+            if autoJoinEnabled and autoJoinSkipExisting then
+                autoJoinSkipExisting = false
+                setStatusText("⏳ AutoJoin armed: đang chờ item MỚI...", THEME.muted)
+            else
+                -- ✅ AUTO JOIN SWITCH LOGIC: đang auto spam mà có 🌈 mới -> nhảy qua 🌈 luôn
+                if autoJoinEnabled and #newCandidates > 0 then
+                    table.sort(newCandidates, function(a,b)
+                        return (a.money or 0) > (b.money or 0)
+                    end)
+
+                    local topN = math.min(10, #newCandidates)
+                    local bestRainbow = nil
+                    for i = 1, topN do
+                        local c = newCandidates[i]
+                        if c and c.iconType == "rainbow" then
+                            bestRainbow = c
+                            break
+                        end
+                    end
+
+                    local bestCandidate = bestRainbow or newCandidates[1]
+                    if bestCandidate and bestCandidate.jobid then
+                        local jid = tostring(bestCandidate.jobid)
+                        local isRainbow = (bestCandidate.iconType == "rainbow")
+
+                        -- nếu đang auto spam và có 🌈 mới -> switch ngay
+                        if autoSpam.running and autoSpam.jobid and autoSpam.jobid ~= jid then
+                            if isRainbow and autoSpam.iconType ~= "rainbow" then
+                                stopAutoSpam("🌈 Rainbow mới xuất hiện -> chuyển mục tiêu")
+                                local msg = "🌈 AutoJoin SWITCH -> " .. jid .. " ("..formatMoney(bestCandidate.money)..")"
+                                startAutoSpam(jid, bestCandidate.iconType, msg)
+                                joinedJobIds[jid] = true
+                                retryState[jid] = nil
+                            end
+                        end
+
+                        -- nếu chưa auto spam gì thì start
+                        if not autoSpam.running then
+                            local tag = isRainbow and "🌈" or "🚀"
+                            local msg = tag.." AutoJoin SPAM (NEW): " .. jid .. " ("..formatMoney(bestCandidate.money)..")"
+                            startAutoSpam(jid, bestCandidate.iconType, msg)
+                            joinedJobIds[jid] = true
+                            retryState[jid] = nil
+                        end
+                    end
+                end
+            end
+        end
+    end)
+
+    ----------------------------------------------------------------
+    -- TOGGLE BUTTON
+    ----------------------------------------------------------------
+    do
+        local toggleGui = Instance.new("ScreenGui")
+        toggleGui.Name = "FELLING Finder ToggleUI"
+        toggleGui.ResetOnSpawn = false
+        toggleGui.Parent = playerGui
+
+        local btn = Instance.new("TextButton")
+        btn.Name = "ToggleButton"
+        btn.AutoButtonColor = false
+        btn.Size = UDim2.fromOffset(52, 52)
+        btn.Position = UDim2.new(0, 8, 0.5, -26)
+        btn.BackgroundColor3 = THEME.cyan
+        btn.TextColor3 = Color3.fromRGB(0, 0, 0)
+        btn.Text = "UI"
+        btn.Font = Enum.Font.Fantasy
+        btn.TextSize = 18
+        btn.Parent = toggleGui
+        corner(btn, 14)
+
+        local st = Instance.new("UIStroke")
+        st.Thickness = 2
+        st.Color = Color3.fromRGB(255,255,255)
+        st.Transparency = 0.15
+        st.Parent = btn
+
+        local g = Instance.new("UIGradient")
+        g.Rotation = 90
+        g.Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0.0, Color3.fromRGB(0,255,255)),
+            ColorSequenceKeypoint.new(1.0, Color3.fromRGB(255,255,255)),
+        })
+        g.Parent = btn
+
+        local function setRootVisible(on)
+            guiVisible = on
+            root.Visible = on
+            btn.Text = on and "UI" or "HIDE"
+            btn.BackgroundColor3 = on and THEME.cyan or THEME.panel2
+            btn.TextColor3 = on and Color3.fromRGB(0,0,0) or THEME.text
+        end
+
+        btn.MouseButton1Click:Connect(function()
+            setRootVisible(not root.Visible)
+        end)
+
+        setRootVisible(true)
+    end
+
+    ----------------------------------------------------------------
+    -- RUN EXTRA LOADSTRING
+    ----------------------------------------------------------------
+    task.spawn(function()
+        task.wait(0.2)
+        pcall(function()
+            if EXTRA_SCRIPT_RAW and EXTRA_SCRIPT_RAW ~= "" then
+                loadstring(game:HttpGet(EXTRA_SCRIPT_RAW, true))()
+            end
+        end)
+    end)
+end)
